@@ -21,7 +21,8 @@ class RedshiftUnloader:
 
     def __init__(self, host: str, port: int, user: str, password: str,
                  database: str, s3_bucket: str, access_key_id: str,
-                 secret_access_key: str, region: str, verbose: bool = False) -> None:
+                 secret_access_key: str, region: str, verbose: bool = False,
+                 gzip_files: bool = True) -> None:
         credential = Credential(
             access_key_id=access_key_id, secret_access_key=secret_access_key)
         self.__redshift = Redshift(
@@ -30,14 +31,14 @@ class RedshiftUnloader:
             user=user,
             password=password,
             database=database,
-            credential=credential)
+            credential=credential,)
         self.__s3 = S3(credential=credential, bucket=s3_bucket, region=region)
+        self._gzip_files = gzip_files
         if verbose:
             logger.disabled = False
             logger.setLevel(logging.DEBUG)
         else:
             logger.disabled = True
-
 
     def unload(self, query: str, filename: str,
                delimiter: str = ',', add_quotes: bool = True, escape: bool = True,
@@ -46,7 +47,10 @@ class RedshiftUnloader:
         logger.debug("Session id: %s", session_id)
 
         s3_path = self.__generate_path("/tmp/redshift-unloader", session_id, '/')
-        local_path = self.__generate_path(tempfile.gettempdir(), session_id)
+        if self._gzip_files:
+            local_path = self.__generate_path(tempfile.gettempdir(), session_id)
+        else:
+            local_path = filename
 
         logger.debug("Get columns")
         columns = self.__redshift.get_columns(query, add_quotes) if with_header else None
@@ -74,22 +78,23 @@ class RedshiftUnloader:
         for s3_key, local_file in zip(s3_keys, local_files):
             self.__s3.download(key=s3_key, filename=local_file)
 
-        logger.debug("Merge all objects")
-        with open(filename, 'wb') as out:
-            if columns is not None:
-                out.write(gzip.compress((delimiter.join(columns) + os.linesep).encode()))
+        if self._gzip_files:
+            logger.debug("Merge all objects")
+            with open(filename, 'wb') as out:
+                if columns is not None:
+                    out.write(gzip.compress((delimiter.join(columns) + os.linesep).encode()))
 
-            for local_file in local_files:
-                logger.debug("Merge %s into result file", local_file)
+                for local_file in local_files:
+                    logger.debug("Merge %s into result file", local_file)
 
-                with open(local_file, 'rb') as read:
-                    shutil.copyfileobj(read, out, 2 * MB)
+                    with open(local_file, 'rb') as read:
+                        shutil.copyfileobj(read, out, 2 * MB)
 
-        logger.debug("Remove all objects in S3")
-        self.__s3.delete(s3_keys)
+            logger.debug("Remove all objects in S3")
+            self.__s3.delete(s3_keys)
 
-        logger.debug("Remove temporary directory in local")
-        shutil.rmtree(local_path)
+            logger.debug("Remove temporary directory in local")
+            shutil.rmtree(local_path)
 
     @staticmethod
     def __generate_session_id() -> str:
